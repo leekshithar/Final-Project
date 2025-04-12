@@ -1,0 +1,708 @@
+# Weather Impact on California Traffic Accidents Analysis
+library(dplyr); library(ggplot2); library(lubridate); library(randomForest); library(caret)
+library(gridExtra); library(scales); library(tidyr); library(cluster); library(ggdendro)
+set.seed(123)
+
+# 1. DATA LOADING AND PREPROCESSING
+accidents_data <- read.csv("C:/Users/hithe/Desktop/project R/Final accident data set.csv", stringsAsFactors = FALSE)
+weather_data <- read.csv("C:/Users/hithe/Desktop/project R/Final weather data set.csv", stringsAsFactors = FALSE)
+cat("Accident data dimensions:", nrow(accidents_data), "x", ncol(accidents_data))
+cat("\nWeather data dimensions:", nrow(weather_data), "x", ncol(weather_data), "\n")
+
+# Process date-time fields
+process_datetime <- function(data, start_col, end_col) {
+  data$start_time <- as.POSIXct(data[[start_col]], format="%m/%d/%Y %H:%M", tz="UTC")
+  if(all(is.na(data$start_time))) {
+    formats <- c("%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%d-%m-%Y %H:%M")
+    for(fmt in formats) {
+      test_convert <- as.POSIXct(data[[start_col]][1:10], format=fmt, tz="UTC")
+      if(!all(is.na(test_convert))) {
+        data$start_time <- as.POSIXct(data[[start_col]], format=fmt, tz="UTC")
+        data$end_time <- as.POSIXct(data[[end_col]], format=fmt, tz="UTC"); break
+      }
+    }
+  } else { data$end_time <- as.POSIXct(data[[end_col]], format="%m/%d/%Y %H:%M", tz="UTC") }
+  
+  data$date <- as.Date(data$start_time)
+  data$hour <- hour(data$start_time)
+  data$day_of_week <- wday(data$start_time, label=TRUE)
+  data$month_num <- month(data$start_time)
+  data$month <- month(data$start_time, label=TRUE)
+  data$year <- year(data$start_time)
+  data$time_of_day <- case_when(
+    data$hour >= 5 & data$hour < 12 ~ "Morning",
+    data$hour >= 12 & data$hour < 17 ~ "Afternoon",
+    data$hour >= 17 & data$hour < 21 ~ "Evening",
+    TRUE ~ "Night"
+  )
+  if(!any(is.na(data$start_time)) && !any(is.na(data$end_time))) {
+    data$duration_mins <- as.numeric(difftime(data$end_time, data$start_time, units="mins"))
+    data$duration_mins[data$duration_mins < 0 | data$duration_mins > 1440] <- NA
+  }
+  return(data)
+}
+
+accidents_data <- process_datetime(accidents_data, "StartTime.UTC.", "EndTime.UTC.")
+weather_data <- process_datetime(weather_data, "StartTime.UTC.", "EndTime.UTC.")
+
+# Create season variable
+accidents_data$season <- case_when(
+  accidents_data$month_num %in% c(12, 1, 2) ~ "Winter",
+  accidents_data$month_num %in% c(3, 4, 5) ~ "Spring",
+  accidents_data$month_num %in% c(6, 7, 8) ~ "Summer",
+  accidents_data$month_num %in% c(9, 10, 11) ~ "Fall",
+  TRUE ~ NA_character_
+)
+weather_data$season <- case_when(
+  weather_data$month_num %in% c(12, 1, 2) ~ "Winter",
+  weather_data$month_num %in% c(3, 4, 5) ~ "Spring",
+  weather_data$month_num %in% c(6, 7, 8) ~ "Summer",
+  weather_data$month_num %in% c(9, 10, 11) ~ "Fall",
+  TRUE ~ NA_character_
+)
+
+# Create county standardized field for joining
+accidents_data$county_std <- tolower(gsub("[^a-zA-Z0-9]", "", accidents_data$County))
+weather_data$county_std <- tolower(gsub("[^a-zA-Z0-9]", "", weather_data$County))
+
+# 2. BASIC VISUALIZATIONS
+p1 <- ggplot(accidents_data, aes(x = hour)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "black") +
+  labs(title = "Accidents by Hour of Day", x = "Hour", y = "Number of Accidents") +
+  theme_minimal() + theme(plot.title = element_text(face = "bold"))
+
+p2 <- ggplot(accidents_data, aes(x = day_of_week)) +
+  geom_bar(fill = "darkred", color = "black") +
+  labs(title = "Accidents by Day of Week", x = "Day of Week", y = "Number of Accidents") +
+  theme_minimal() + theme(plot.title = element_text(face = "bold"))
+
+grid.arrange(p1, p2, ncol = 2)
+
+# 3. SEASONAL ANALYSIS
+if(any(!is.na(accidents_data$season))) {
+  seasonal_accidents <- accidents_data %>%
+    filter(!is.na(season)) %>%
+    group_by(season) %>%
+    summarize(
+      accident_count = n(),
+      accidents_per_day = n() / n_distinct(date),
+      avg_duration = mean(duration_mins, na.rm = TRUE),
+      .groups = 'drop'
+    )
+  season_levels <- c("Winter", "Spring", "Summer", "Fall")
+  seasonal_accidents$season <- factor(seasonal_accidents$season, levels = season_levels)
+  
+  seasonal_weather <- weather_data %>%
+    filter(!is.na(season)) %>%
+    group_by(season, Type) %>%
+    summarize(count = n(), .groups = 'drop') %>%
+    group_by(season) %>%
+    mutate(percent = count / sum(count) * 100) %>%
+    ungroup() %>%
+    mutate(season = factor(season, levels = season_levels))
+  
+  p5 <- ggplot(seasonal_accidents, aes(x = season, y = accident_count, fill = season)) +
+    geom_bar(stat = "identity", color = "black") +
+    labs(title = "Accident Count by Season", x = "Season", y = "Number of Accidents") +
+    theme_minimal() + theme(plot.title = element_text(face = "bold"), legend.position = "none")
+  
+  p6 <- ggplot(seasonal_accidents, aes(x = season, y = avg_duration, fill = season)) +
+    geom_bar(stat = "identity", color = "black") +
+    labs(title = "Average Accident Duration by Season", x = "Season", y = "Duration (minutes)") +
+    theme_minimal() + theme(plot.title = element_text(face = "bold"), legend.position = "none")
+  
+  p7 <- ggplot(seasonal_weather, aes(x = season, y = count, fill = Type)) +
+    geom_bar(stat = "identity", position = "stack") +
+    labs(title = "Weather Types by Season", x = "Season", y = "Number of Weather Events") +
+    theme_minimal() + theme(plot.title = element_text(face = "bold"))
+  
+  grid.arrange(p5, p6, p7, layout_matrix = rbind(c(1,2), c(3,3)))
+}
+
+# 4. MONTHLY ANALYSIS (if seasonal not available)
+if(!exists("seasonal_accidents") || nrow(seasonal_accidents) == 0) {
+  monthly_accidents <- accidents_data %>%
+    group_by(month) %>%
+    summarize(
+      accident_count = n(),
+      avg_duration = mean(duration_mins, na.rm = TRUE),
+      .groups = 'drop'
+    )
+  month_order <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+  monthly_accidents$month <- factor(monthly_accidents$month, levels = month_order)
+  
+  p5a <- ggplot(monthly_accidents, aes(x = month, y = accident_count, fill = month)) +
+    geom_bar(stat = "identity", color = "black") +
+    labs(title = "Accident Count by Month", x = "Month", y = "Number of Accidents") +
+    theme_minimal() + theme(plot.title = element_text(face = "bold"), 
+                            legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  p6a <- ggplot(monthly_accidents, aes(x = month, y = avg_duration, fill = month)) +
+    geom_bar(stat = "identity", color = "black") +
+    labs(title = "Average Accident Duration by Month", x = "Month", y = "Duration (minutes)") +
+    theme_minimal() + theme(plot.title = element_text(face = "bold"), 
+                            legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  if(n_distinct(weather_data$Type) > 1) {
+    monthly_weather <- weather_data %>%
+      group_by(month, Type) %>%
+      summarize(count = n(), .groups = 'drop') %>%
+      mutate(month = factor(month, levels = month_order))
+    
+    p7a <- ggplot(monthly_weather, aes(x = month, y = count, fill = Type)) +
+      geom_bar(stat = "identity", position = "stack") +
+      labs(title = "Weather Types by Month", x = "Month", y = "Number of Weather Events") +
+      theme_minimal() + theme(plot.title = element_text(face = "bold"),
+                              axis.text.x = element_text(angle = 45, hjust = 1))
+    
+    grid.arrange(p5a, p6a, p7a, layout_matrix = rbind(c(1,2), c(3,3)))
+  } else {
+    grid.arrange(p5a, p6a, ncol = 2)
+  }
+}
+
+# 5. TIME OF DAY & REGIONAL ANALYSIS
+tod_accidents <- accidents_data %>%
+  group_by(time_of_day) %>%
+  summarize(
+    accident_count = n(),
+    avg_duration = mean(duration_mins, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  mutate(time_of_day = factor(time_of_day, levels = c("Morning", "Afternoon", "Evening", "Night")))
+
+p9 <- ggplot(tod_accidents, aes(x = time_of_day, y = accident_count, fill = time_of_day)) +
+  geom_bar(stat = "identity", color = "black") +
+  labs(title = "Accidents by Time of Day", x = "Time of Day", y = "Number of Accidents") +
+  theme_minimal() + theme(plot.title = element_text(face = "bold"), legend.position = "none")
+
+if(n_distinct(weather_data$Type) > 1) {
+  tod_weather <- weather_data %>%
+    group_by(time_of_day, Type) %>%
+    summarize(count = n(), .groups = 'drop') %>%
+    mutate(time_of_day = factor(time_of_day, levels = c("Morning", "Afternoon", "Evening", "Night")))
+  
+  p10 <- ggplot(tod_weather, aes(x = time_of_day, y = count, fill = Type)) +
+    geom_bar(stat = "identity", position = "stack") +
+    labs(title = "Weather Types by Time of Day", x = "Time of Day", y = "Number of Weather Events") +
+    theme_minimal() + theme(plot.title = element_text(face = "bold"), legend.position = "bottom")
+  
+  grid.arrange(p9, p10, ncol = 2)
+} else {
+  print(p9)
+}
+
+county_accidents <- accidents_data %>%
+  group_by(County) %>%
+  summarize(
+    accident_count = n(),
+    avg_duration = mean(duration_mins, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(accident_count))
+top_counties <- head(county_accidents, 10)
+
+p11 <- ggplot(top_counties, aes(x = reorder(County, accident_count), y = accident_count)) +
+  geom_bar(stat = "identity", fill = "skyblue", color = "black") +
+  coord_flip() +
+  labs(title = "Top 10 Counties by Accident Count", x = "County", y = "Number of Accidents") +
+  theme_minimal() + theme(plot.title = element_text(face = "bold"))
+
+print(p11)
+
+# 6. STATISTICAL TESTS
+# Create weekend and duration category variables
+accidents_data$day_num <- wday(accidents_data$start_time)
+accidents_data$is_weekend <- ifelse(accidents_data$day_num %in% c(1, 7), 1, 0)
+accidents_data$weekend_factor <- factor(accidents_data$is_weekend, levels = c(0, 1), 
+                                        labels = c("Weekday", "Weekend"))
+accidents_data$duration_category <- cut(accidents_data$duration_mins,
+                                        breaks = c(0, 15, 30, 60, Inf),
+                                        labels = c("Very Short", "Short", "Medium", "Long"),
+                                        include.lowest = TRUE)
+
+# ANOVA test
+anova_weekend <- aov(duration_mins ~ weekend_factor, data = accidents_data)
+cat("\nANOVA Test: Weekend vs Weekday Impact on Duration\n")
+print(summary(anova_weekend))
+
+# Weekend vs weekday plot
+p_weekend <- ggplot(accidents_data, aes(x = weekend_factor, y = duration_mins)) +
+  geom_boxplot(fill = c("skyblue", "lightgreen"), width = 0.6, 
+               outlier.shape = 1, outlier.size = 2, outlier.alpha = 0.5) +
+  labs(title = "Accident Duration: Weekday vs Weekend", x = "Day Type", y = "Duration (minutes)") +
+  theme_minimal() + theme(plot.title = element_text(face = "bold")) +
+  scale_y_continuous(limits = c(0, min(300, max(accidents_data$duration_mins, na.rm = TRUE))))
+
+# Chi-square test
+season_duration_table <- table(accidents_data$season, accidents_data$duration_category)
+chi_season_duration <- chisq.test(season_duration_table)
+cat("\nChi-Square Test: Season vs Duration Category\n")
+print(chi_season_duration)
+
+# Season vs duration plot
+season_duration_df <- as.data.frame(season_duration_table)
+names(season_duration_df) <- c("Season", "Duration", "Freq")
+season_duration_df <- season_duration_df %>%
+  group_by(Season) %>%
+  mutate(Percentage = Freq / sum(Freq) * 100) %>%
+  ungroup()
+
+p_season <- ggplot(season_duration_df, aes(x = Season, y = Percentage, fill = Duration)) +
+  geom_bar(stat = "identity", position = "fill", width = 0.7) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Association: Season and Accident Duration", y = "Proportion") +
+  theme_minimal() + theme(plot.title = element_text(face = "bold")) +
+  scale_y_continuous(labels = scales::percent_format(scale = 1))
+
+grid.arrange(p_weekend, p_season, ncol = 2)
+
+# 7. ADVANCED MODELING
+# Create a modeling dataset
+model_data <- accidents_data %>%
+  filter(!is.na(duration_mins), !is.na(season), !is.na(time_of_day)) %>%
+  mutate(
+    long_duration = ifelse(duration_mins > 60, 1, 0),
+    season = factor(season, levels = c("Winter", "Spring", "Summer", "Fall")),
+    time_of_day = factor(time_of_day, levels = c("Morning", "Afternoon", "Evening", "Night")),
+    day_of_week = factor(day_of_week),
+    hour_group = cut(hour, breaks = c(0, 6, 12, 18, 24), 
+                     labels = c("Night (0-6)", "Morning (6-12)", 
+                                "Afternoon (12-18)", "Evening (18-24)"))
+  )
+
+# Split data
+set.seed(123)
+train_index <- createDataPartition(model_data$long_duration, p = 0.7, list = FALSE)
+train_data <- model_data[train_index, ]
+test_data <- model_data[-train_index, ]
+
+# 7.1 LOGISTIC REGRESSION
+logistic_model <- glm(
+  long_duration ~ season + time_of_day + day_of_week + hour_group,
+  family = binomial(link = "logit"),
+  data = train_data
+)
+
+# Make predictions and evaluate
+logistic_pred_prob <- predict(logistic_model, newdata = test_data, type = "response")
+logistic_pred_class <- ifelse(logistic_pred_prob > 0.5, 1, 0)
+logistic_conf_matrix <- table(Predicted = logistic_pred_class, Actual = test_data$long_duration)
+logistic_accuracy <- sum(diag(logistic_conf_matrix)) / sum(logistic_conf_matrix)
+
+# Visualize logistic regression coefficients
+coef_data <- data.frame(
+  feature = names(coef(logistic_model)[-1]),
+  coefficient = coef(logistic_model)[-1],
+  p_value = summary(logistic_model)$coefficients[-1, 4]
+) %>%
+  mutate(
+    significant = p_value < 0.05,
+    feature = gsub("season|time_of_day|day_of_week|hour_group", "", feature),
+    feature = gsub("^", "", feature)
+  ) %>%
+  arrange(p_value)
+
+p_logistic <- ggplot(head(coef_data, 10), 
+                     aes(x = reorder(feature, abs(coefficient)), y = coefficient, fill = significant)) +
+  geom_bar(stat = "identity") + coord_flip() +
+  scale_fill_manual(values = c("gray70", "steelblue")) +
+  labs(title = "Top Predictors of Long-Duration Accidents", x = "Feature", y = "Coefficient") +
+  theme_minimal() + theme(plot.title = element_text(face = "bold"))
+
+print(p_logistic)
+
+# 7.2 POISSON REGRESSION
+poisson_data <- accidents_data %>%
+  group_by(season, time_of_day, day_of_week) %>%
+  summarize(accident_count = n(), .groups = 'drop') %>%
+  filter(!is.na(season), !is.na(time_of_day), !is.na(day_of_week)) %>%
+  mutate(
+    season = factor(season, levels = c("Winter", "Spring", "Summer", "Fall")),
+    time_of_day = factor(time_of_day, levels = c("Morning", "Afternoon", "Evening", "Night")),
+    day_of_week = factor(day_of_week)
+  )
+
+poisson_train_index <- createDataPartition(poisson_data$accident_count, p = 0.7, list = FALSE)
+poisson_train <- poisson_data[poisson_train_index, ]
+poisson_test <- poisson_data[-poisson_train_index, ]
+
+poisson_model <- glm(
+  accident_count ~ season + time_of_day + day_of_week,
+  family = poisson(link = "log"),
+  data = poisson_train
+)
+
+poisson_pred <- predict(poisson_model, newdata = poisson_test, type = "response")
+poisson_rmse <- sqrt(mean((poisson_test$accident_count - poisson_pred)^2))
+
+# Poisson model visualization
+poisson_results <- data.frame(actual = poisson_test$accident_count, predicted = poisson_pred)
+p_poisson <- ggplot(poisson_results, aes(x = actual, y = predicted)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  labs(title = "Poisson Model: Actual vs Predicted Counts", x = "Actual", y = "Predicted") +
+  theme_minimal() + theme(plot.title = element_text(face = "bold"))
+
+print(p_poisson)
+
+# 7.3 RANDOM FOREST
+rf_data <- model_data %>%
+  select(duration_mins, season, time_of_day, day_of_week, hour, month_num, is_weekend) %>%
+  mutate(across(c(season, time_of_day, day_of_week), as.factor))
+
+rf_train_index <- createDataPartition(rf_data$duration_mins, p = 0.7, list = FALSE)
+rf_train <- rf_data[rf_train_index, ]
+rf_test <- rf_data[-rf_train_index, ]
+
+rf_model <- randomForest(
+  duration_mins ~ .,
+  data = rf_train,
+  ntree = 200,
+  importance = TRUE
+)
+
+rf_predictions <- predict(rf_model, newdata = rf_test)
+rf_rmse <- sqrt(mean((rf_test$duration_mins - rf_predictions)^2))
+rf_r2 <- 1 - sum((rf_test$duration_mins - rf_predictions)^2) / 
+  sum((rf_test$duration_mins - mean(rf_test$duration_mins))^2)
+
+# RF visualization - importance plot and predictions
+imp_data <- data.frame(
+  Feature = rownames(importance(rf_model)),
+  IncMSE = importance(rf_model)[, 1]
+) %>% arrange(desc(IncMSE))
+
+p_importance <- ggplot(imp_data, aes(x = reorder(Feature, IncMSE), y = IncMSE)) +
+  geom_bar(stat = "identity", fill = "darkgreen") + coord_flip() +
+  labs(title = "Random Forest Variable Importance", x = "Feature", y = "Importance") +
+  theme_minimal() + theme(plot.title = element_text(face = "bold"))
+
+p_rf_pred <- ggplot(data.frame(Actual = rf_test$duration_mins, Predicted = rf_predictions),
+                    aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.3) +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  labs(title = "Random Forest: Actual vs Predicted Duration") +
+  theme_minimal() + theme(plot.title = element_text(face = "bold")) +
+  xlim(0, 300) + ylim(0, 300)
+
+grid.arrange(p_importance, p_rf_pred, ncol = 2)
+
+# 7.4 HIERARCHICAL CLUSTERING FOR WEATHER IMPACT ANALYSIS
+cat("\n----- HIERARCHICAL CLUSTERING FOR WEATHER IMPACT -----\n")
+cat("Using hierarchical clustering to identify weather-related accident patterns\n")
+
+# Create a simplified dataset for clustering with key features
+# First, create aggregated data by weather type
+weather_impact <- accidents_data %>%
+  # Join with simplified weather data
+  left_join(
+    weather_data %>% 
+      select(date, county_std, Type),
+    by = c("date" = "date", "county_std" = "county_std")
+  ) %>%
+  # Filter to only rows with weather data
+  filter(!is.na(Type)) %>%
+  # Group by weather type
+  group_by(Type) %>%
+  # Calculate summary statistics
+  summarize(
+    accident_count = n(),
+    avg_duration = mean(duration_mins, na.rm = TRUE),
+    med_duration = median(duration_mins, na.rm = TRUE),
+    avg_hour = mean(hour, na.rm = TRUE),
+    pct_weekend = mean(is_weekend, na.rm = TRUE) * 100,
+    morning_pct = mean(time_of_day == "Morning", na.rm = TRUE) * 100,
+    afternoon_pct = mean(time_of_day == "Afternoon", na.rm = TRUE) * 100,
+    evening_pct = mean(time_of_day == "Evening", na.rm = TRUE) * 100,
+    night_pct = mean(time_of_day == "Night", na.rm = TRUE) * 100,
+    .groups = 'drop'
+  ) %>%
+  # Filter to only weather types with at least 5 accidents for reliability
+  filter(accident_count >= 5)
+
+# Print the weather impact summary
+cat("\nWeather Impact Summary:\n")
+print(weather_impact)
+
+# Prepare data for hierarchical clustering
+# Select numerical features
+hc_data <- weather_impact %>%
+  select(-Type, -accident_count) %>%  # Remove non-numeric columns
+  scale()  # Standardize the data
+
+rownames(hc_data) <- weather_impact$Type  # Use weather types as row names
+
+# Calculate distance matrix
+dist_matrix <- dist(hc_data, method = "euclidean")
+
+# Perform hierarchical clustering
+hc_result <- hclust(dist_matrix, method = "ward.D2")
+
+# Plot dendrogram
+plot(hc_result, main = "Hierarchical Clustering of Weather Types",
+     xlab = "Weather Type", ylab = "Distance", hang = -1)
+rect.hclust(hc_result, k = 4, border = "red")  # Draw boxes around 4 clusters
+
+# Cut tree to get cluster assignments (using 4 clusters)
+weather_clusters <- cutree(hc_result, k = 4)
+
+# Add cluster assignments back to the data
+weather_impact$cluster <- factor(weather_clusters)
+
+# Cluster summary
+weather_cluster_summary <- weather_impact %>%
+  group_by(cluster) %>%
+  summarize(
+    weather_types = toString(Type),
+    num_types = n_distinct(Type),
+    total_accidents = sum(accident_count),
+    avg_duration = weighted.mean(avg_duration, accident_count),
+    avg_hour = weighted.mean(avg_hour, accident_count),
+    pct_weekend = weighted.mean(pct_weekend, accident_count),
+    .groups = 'drop'
+  ) %>%
+  arrange(cluster)
+
+cat("\nWeather Cluster Summary:\n")
+print(weather_cluster_summary)
+
+# Create a more informative visualization using ggplot2
+# Create dendrogram data
+dendr <- as.dendrogram(hc_result)
+dendr_data <- dendro_data(dendr, type = "rectangle")
+
+# Create more elegant dendrogram
+p_dendrogram <- ggplot(segment(dendr_data)) +
+  geom_segment(aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_text(data = label(dendr_data), 
+            aes(x = x, y = y, label = label, color = factor(weather_clusters[label])),
+            hjust = 0, angle = 90, size = 3) +
+  labs(title = "Hierarchical Clustering of Weather Types",
+       subtitle = "Colors indicate cluster membership",
+       x = NULL, y = "Height") +
+  scale_color_brewer(palette = "Set1", name = "Cluster") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+print(p_dendrogram)
+
+# Create heatmap visualization of feature values by weather type
+heatmap_data <- weather_impact %>%
+  select(Type, cluster, avg_duration, avg_hour, pct_weekend,
+         morning_pct, afternoon_pct, evening_pct, night_pct) %>%
+  # Arrange by cluster for better visualization
+  arrange(cluster)
+
+# Prepare data for heatmap
+heatmap_long <- heatmap_data %>%
+  pivot_longer(cols = c(avg_duration, avg_hour, pct_weekend, 
+                        morning_pct, afternoon_pct, evening_pct, night_pct),
+               names_to = "Feature", values_to = "Value") %>%
+  # Make feature names more readable
+  mutate(Feature = case_when(
+    Feature == "avg_duration" ~ "Avg Duration (min)",
+    Feature == "avg_hour" ~ "Avg Hour of Day",
+    Feature == "pct_weekend" ~ "Weekend %",
+    Feature == "morning_pct" ~ "Morning %",
+    Feature == "afternoon_pct" ~ "Afternoon %",
+    Feature == "evening_pct" ~ "Evening %",
+    Feature == "night_pct" ~ "Night %",
+    TRUE ~ Feature
+  ))
+
+# Create a custom z-score to make the heatmap more interpretable
+heatmap_long <- heatmap_long %>%
+  group_by(Feature) %>%
+  mutate(
+    z_score = (Value - mean(Value)) / sd(Value)
+  ) %>%
+  ungroup()
+
+# Create the heatmap
+p_heatmap <- ggplot(heatmap_long, aes(x = Type, y = Feature, fill = z_score)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0,
+                       name = "Z-score") +
+  facet_grid(. ~ cluster, scales = "free_x", space = "free_x") +
+  labs(title = "Weather Impact Patterns by Cluster",
+       subtitle = "Red = higher than average, Blue = lower than average",
+       x = "Weather Type", y = NULL) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        panel.spacing = unit(0.5, "lines"),
+        strip.text = element_text(face = "bold"))
+
+print(p_heatmap)
+
+# Create a parallel coordinate plot to visualize cluster characteristics
+                  parallel_data <- weather_impact %>%
+                    select(Type, cluster, avg_duration, avg_hour, pct_weekend, morning_pct, 
+                           afternoon_pct, evening_pct, night_pct) %>%
+                    # Scale the values for better comparison
+                    mutate(across(c(avg_duration, avg_hour, pct_weekend, morning_pct, 
+                                    afternoon_pct, evening_pct, night_pct), scale))
+                  
+                  parallel_long <- parallel_data %>%
+                    pivot_longer(cols = c(avg_duration, avg_hour, pct_weekend, morning_pct, 
+                                          afternoon_pct, evening_pct, night_pct),
+                                 names_to = "Feature", values_to = "Value") %>%
+                    mutate(Feature = factor(Feature, levels = c("avg_duration", "avg_hour", "pct_weekend", 
+                                                                "morning_pct", "afternoon_pct", "evening_pct", "night_pct")))
+                  
+                  p_parallel <- ggplot(parallel_long, aes(x = Feature, y = Value, group = Type, color = cluster)) +
+                    geom_line(alpha = 0.7) +
+                    labs(title = "Parallel Coordinate Plot of Weather Clusters",
+                         x = NULL, y = "Standardized Value", color = "Cluster") +
+                    scale_color_brewer(palette = "Set1") +
+                    theme_minimal() +
+                    theme(plot.title = element_text(face = "bold"),
+                          axis.text.x = element_text(angle = 45, hjust = 1))
+                  
+                  print(p_parallel)
+                  
+                  # Generate key insights for each cluster
+                  weather_cluster_insights <- weather_impact %>%
+                    group_by(cluster) %>%
+                    summarize(
+                      top_weather = Type[which.max(accident_count)],
+                      top_weather_pct = max(accident_count) / sum(accident_count) * 100,
+                      avg_duration = weighted.mean(avg_duration, accident_count),
+                      primary_time = case_when(
+                        weighted.mean(morning_pct, accident_count) > 
+                          max(weighted.mean(afternoon_pct, accident_count), 
+                              weighted.mean(evening_pct, accident_count),
+                              weighted.mean(night_pct, accident_count)) ~ "Morning",
+                        weighted.mean(afternoon_pct, accident_count) > 
+                          max(weighted.mean(morning_pct, accident_count), 
+                              weighted.mean(evening_pct, accident_count),
+                              weighted.mean(night_pct, accident_count)) ~ "Afternoon",
+                        weighted.mean(evening_pct, accident_count) > 
+                          max(weighted.mean(morning_pct, accident_count), 
+                              weighted.mean(afternoon_pct, accident_count),
+                              weighted.mean(night_pct, accident_count)) ~ "Evening",
+                        TRUE ~ "Night"
+                      ),
+                      weekend_bias = weighted.mean(pct_weekend, accident_count) > 29,  # 2/7 days are weekends (~29%)
+                      .groups = 'drop'
+                    )
+                  
+                  # 8. KEY FINDINGS AND RECOMMENDATIONS
+                  cat("\n===== KEY FINDINGS =====\n")
+                  
+                  # Time patterns
+                  peak_hour <- as.numeric(names(sort(table(accidents_data$hour), decreasing = TRUE)[1]))
+                  cat("1. TEMPORAL PATTERNS:\n")
+                  cat("   - Peak accident hour:", peak_hour, "\n")
+                  cat("   - Most accidents during:", tod_accidents$time_of_day[which.max(tod_accidents$accident_count)], "\n")
+                  if(exists("seasonal_accidents") && nrow(seasonal_accidents) > 0) {
+                    cat("   - Season with highest accident rate:", 
+                        as.character(seasonal_accidents$season[which.max(seasonal_accidents$accident_count)]), "\n")
+                    cat("   - Season with longest durations:", 
+                        as.character(seasonal_accidents$season[which.max(seasonal_accidents$avg_duration)]), "\n")
+                  }
+                  
+                  # Weather patterns
+                  if(n_distinct(weather_data$Type) > 1) {
+                    weather_counts <- weather_data %>%
+                      count(Type) %>%
+                      arrange(desc(n)) %>%
+                      mutate(percent = n / sum(n) * 100)
+                    cat("\n2. WEATHER PATTERNS:\n")
+                    cat("   - Most common weather type:", weather_counts$Type[1], 
+                        "(", round(weather_counts$percent[1], 1), "%)\n")
+                  }
+                  
+                  # Regional insights
+                  cat("\n3. REGIONAL INSIGHTS:\n")
+                  cat("   - County with highest accident frequency:", top_counties$County[1], "\n")
+                  
+                  # Model insights
+                  cat("\n4. MODEL INSIGHTS:\n")
+                  cat("   - Logistic regression accuracy:", round(logistic_accuracy * 100, 1), "%\n")
+                  cat("   - Poisson model RMSE:", round(poisson_rmse, 2), "\n")
+                  cat("   - Random Forest R²:", round(rf_r2, 3), "and RMSE:", round(rf_rmse, 2), "minutes\n")
+                  cat("   - Top predictors of accident duration:", 
+                      paste(head(rownames(importance(rf_model)), 3), collapse=", "), "\n")
+                  
+                  # Weather cluster insights
+                  cat("\n5. HIERARCHICAL CLUSTERING INSIGHTS:\n")
+                  for(i in 1:nrow(weather_cluster_insights)) {
+                    cat(paste0("   - Weather Cluster ", i, ": Dominated by ", 
+                               weather_cluster_insights$top_weather[i], 
+                               " weather, with average accident duration of ", 
+                               round(weather_cluster_insights$avg_duration[i], 1), 
+                               " minutes, primarily during ", 
+                               tolower(weather_cluster_insights$primary_time[i]), 
+                               " hours",
+                               ifelse(weather_cluster_insights$weekend_bias[i], 
+                                      ", with weekend bias", 
+                                      ", with weekday bias"),
+                               ".\n"))
+                  }
+                  
+                  # Recommendations
+                  cat("\n===== RECOMMENDATIONS =====\n")
+                  cat("1. TIME-BASED STRATEGIES:\n")
+                  cat("   - Focus resources during peak hours (", peak_hour, ")\n", sep="")
+                  
+                  # Seasonal recommendations
+                  if(exists("seasonal_accidents") && nrow(seasonal_accidents) > 0) {
+                    high_freq_season <- as.character(seasonal_accidents$season[which.max(seasonal_accidents$accident_count)])
+                    long_dur_season <- as.character(seasonal_accidents$season[which.max(seasonal_accidents$avg_duration)])
+                    cat("\n2. SEASONAL STRATEGIES:\n")
+                    cat("   - Implement preventive measures during", high_freq_season, "season\n")
+                    if(high_freq_season != long_dur_season) {
+                      cat("   - Prepare for longer clearance times during", long_dur_season, "season\n")
+                    }
+                  }
+                  
+                  # Location recommendations
+                  cat("\n3. LOCATION-BASED STRATEGIES:\n")
+                  cat("   - Prioritize improvements in", top_counties$County[1], "County\n")
+                  if(n_distinct(weather_data$Type) > 1) {
+                    cat("   - Implement special precautions during", weather_counts$Type[1], "conditions\n")
+                  }
+                  
+                  # Weather cluster recommendations
+                  cat("\n4. WEATHER CLUSTER STRATEGIES:\n")
+                  # Find the cluster with the longest average duration
+                  longest_duration_cluster <- weather_cluster_insights$cluster[
+                    which.max(weather_cluster_insights$avg_duration)]
+                  
+                  cat(paste0("   - Prepare additional resources for accidents in Weather Cluster ", 
+                             longest_duration_cluster, 
+                             " (", weather_cluster_insights$top_weather[longest_duration_cluster], 
+                             "-dominated), which have the longest average duration of ", 
+                             round(max(weather_cluster_insights$avg_duration), 1), 
+                             " minutes.\n"))
+                  
+                  # Find the cluster with the strongest weekend bias
+                  if(any(weather_cluster_insights$weekend_bias)) {
+                    weekend_clusters <- weather_cluster_insights$cluster[weather_cluster_insights$weekend_bias]
+                    weekend_weathers <- weather_cluster_insights$top_weather[weather_cluster_insights$weekend_bias]
+                    
+                    cat(paste0("   - Schedule additional weekend coverage for Weather Cluster ", 
+                               paste(weekend_clusters, collapse = ", "), 
+                               " (", paste(weekend_weathers, collapse = ", "), 
+                               "), which show a weekend bias in accident occurrences.\n"))
+                  }
+                  
+                  # Provide time-of-day recommendations
+                  time_recommendations <- weather_cluster_insights %>%
+                    group_by(primary_time) %>%
+                    summarize(
+                      clusters = toString(cluster),
+                      weather_types = toString(top_weather),
+                      .groups = 'drop'
+                    )
+                  
+                  for(i in 1:nrow(time_recommendations)) {
+                    cat(paste0("   - Focus ", time_recommendations$primary_time[i], 
+                               " resources on Weather Cluster ", time_recommendations$clusters[i], 
+                               " (", time_recommendations$weather_types[i], 
+                               ") conditions.\n"))
+                  }
